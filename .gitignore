@@ -5,8 +5,8 @@ __pycache__/
 venv/
 env/
 
-# Datasets (Uncomment if you don't want the CSV on GitHub)
-# bts_2.csv
+# Datasets
+#bts.csv
 
 # Generated output plots
 *.png
