@@ -29,36 +29,43 @@ def clean_genius_lyrics(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 def load_and_preprocess_data(csv_path="bts.csv"):
-    """Loads dataset, cleans lyrics, extracts metadata, and handles missing values safely."""
+    """Loads dataset, cleans lyrics, filters Japanese tracks, and assigns Thayer emotion labels."""
     print("Loading and preprocessing data...")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Dataset not found at {csv_path}. Please place bts.csv in your workspace directory.")
+    
     df = pd.read_csv(csv_path)
+    
+    # Drop rows missing lyrics or valence/energy
+    df = df.dropna(subset=['lyrics', 'spotify_track_valence', 'spotify_track_energy']).copy()
     
     df['clean_lyrics'] = df['lyrics'].apply(clean_genius_lyrics)
     
-    # Exclude Japanese tracks
+    # Exclude Japanese tracks via language column and unicode script checking
+    df = df[~df['lang'].fillna('').str.lower().str.contains('jpn|japanese', na=False)]
     df = df[~df['lyrics'].str.contains(r'[\u3040-\u309F\u30A0-\u30FF]', regex=True, na=False)]
     
-    # Engineered Features (Safe checks preventing attribute errors)
+    # Engineered Metadata Features
     df['is_korean'] = df['lyrics'].str.contains(r'[\u3131-\u318E\uAC00-\uD7A3]', regex=True).astype(float)
     df['is_english'] = df['lyrics'].str.contains(r'[a-zA-Z]', regex=True).astype(float)
-    
-    if 'year' in df.columns:
-        df['year'] = pd.to_numeric(df['year'], errors='coerce').fillna(2018.0).astype(float)
-    else:
-        df['year'] = 2018.0
+    df['year'] = pd.to_numeric(pd.to_datetime(df['album_rd'], errors='coerce').dt.year, errors='coerce').fillna(2018.0).astype(float)
+    df['views'] = 0.0
 
-    if 'views' in df.columns:
-        df['views'] = pd.to_numeric(df['views'], errors='coerce').fillna(0.0).astype(float)
-    else:
-        df['views'] = 0.0
-    
-    # Filter empty lyrics
+    # Grounded Emotion Labeling via Thayer's Model (Valence vs Energy)
+    def assign_thayer_emotion(row):
+        v = row['spotify_track_valence']
+        e = row['spotify_track_energy']
+        if v >= 0.5 and e >= 0.75:
+            return 'Happy'
+        elif v < 0.5 and e < 0.75:
+            return 'Sad'
+        elif v < 0.5 and e >= 0.75:
+            return 'Raring'
+        else:
+            return 'Calm'
+
+    df['tag'] = df.apply(assign_thayer_emotion, axis=1)
     df = df[df['clean_lyrics'].str.strip() != ''].reset_index(drop=True)
-    
-    # Target Labels
-    np.random.seed(42)
-    df['tag'] = np.random.choice(['Raring', 'Calm', 'Sad', 'Happy'], size=len(df))
-    
     return df
 
 def plot_confusion_matrix(y_true, y_pred, classes, title, cmap='Blues'):
@@ -71,23 +78,23 @@ def plot_confusion_matrix(y_true, y_pred, classes, title, cmap='Blues'):
     plt.ylabel('True Label')
     plt.tight_layout()
     plt.savefig(f"{title.replace(' ', '_')}.png")
-    plt.show()
+    plt.close()
 
 def compute_metrics(y_true, y_pred):
-    """Computes overall accuracy, precision, recall, and F1-score (macro average)."""
+    """Computes overall accuracy, precision, recall, and macro F1-score."""
     acc = accuracy_score(y_true, y_pred)
     prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
     return {'Accuracy': acc, 'Precision': prec, 'Recall': rec, 'F1-Score': f1}
 
 def main():
-    # 1. Load Data
     bts_df = load_and_preprocess_data("bts.csv")
-    print(f"Total tracks processed: {len(bts_df)}")
+    print(f"Total processed tracks after filtering: {len(bts_df)}")
+    print("Class distribution:\n", bts_df['tag'].value_counts())
     
-    # 2. Encode & Split (Stratified 80/20)
     le = LabelEncoder()
     bts_df['label'] = le.fit_transform(bts_df['tag'])
     
+    # Stratified 80/20 Train-Test Split
     train_df, test_df = train_test_split(
         bts_df, test_size=0.2, random_state=42, stratify=bts_df['label']
     )
@@ -104,17 +111,15 @@ def main():
     
     performance_records = []
     
-    # 3. Baseline Model (TF-IDF + LinearSVC with Class Weighting)
+    # 1. Baseline Model (TF-IDF + LinearSVC)
     print("\n--- Training LinearSVC Baseline ---")
     start_time = time.time()
-    
     tfidf = TfidfVectorizer(max_features=3000, ngram_range=(1, 2))
     X_train_tfidf = tfidf.fit_transform(X_train_text)
     X_test_tfidf = tfidf.transform(X_test_text)
     
     svc = LinearSVC(class_weight='balanced', C=0.5, max_iter=2000, random_state=42)
     svc.fit(X_train_tfidf, y_train)
-    
     train_time_svc = time.time() - start_time
     
     inf_start = time.time()
@@ -133,7 +138,7 @@ def main():
     print(classification_report(y_test, y_pred_svc, target_names=le.classes_))
     plot_confusion_matrix(y_test, y_pred_svc, le.classes_, 'LinearSVC Confusion Matrix')
     
-    # 4. Regularized Deep Learning Model (Dual-Input 1D CNN with Early Stopping)
+    # 2. Deep Learning Model (Regularized Dual-Input 1D CNN with Early Stopping)
     print("\n--- Training Regularized Dual-Input 1D CNN ---")
     MAX_VOCAB, MAX_SEQ_LENGTH = 5000, 300
     
@@ -143,10 +148,10 @@ def main():
     X_train_seq = pad_sequences(tokenizer.texts_to_sequences(X_train_text), maxlen=MAX_SEQ_LENGTH, padding='post')
     X_test_seq = pad_sequences(tokenizer.texts_to_sequences(X_test_text), maxlen=MAX_SEQ_LENGTH, padding='post')
     
-    # Regularized Architecture
+    # Neural Network Architecture
     text_input = Input(shape=(MAX_SEQ_LENGTH,), name="text_input")
     x = Embedding(input_dim=MAX_VOCAB, output_dim=64)(text_input)
-    x = SpatialDropout1D(0.4)(x)
+    x = SpatialDropout1D(0.3)(x)
     x = Conv1D(filters=64, kernel_size=5, activation='relu', kernel_regularizer=l2(0.001))(x)
     x = GlobalMaxPooling1D()(x)
     x = Dense(32, activation='relu', kernel_regularizer=l2(0.001))(x)
@@ -156,17 +161,15 @@ def main():
     
     z = Concatenate()([x, y_branch])
     z = Dense(32, activation='relu', kernel_regularizer=l2(0.001))(z)
-    z = Dropout(0.6)(z)
+    z = Dropout(0.5)(z)
     output = Dense(len(le.classes_), activation='softmax')(z)
     
     cnn_model = Model(inputs=[text_input, meta_input], outputs=output)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
-    cnn_model.compile(loss='sparse_categorical_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+    cnn_model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
     
-    # Early Stopping Callback to Prevent Overfitting
     early_stopping = EarlyStopping(
         monitor='val_loss', 
-        patience=3, 
+        patience=4, 
         restore_best_weights=True,
         verbose=1
     )
@@ -175,30 +178,29 @@ def main():
     history = cnn_model.fit(
         {'text_input': X_train_seq, 'meta_input': X_train_meta}, y_train,
         validation_data=({'text_input': X_test_seq, 'meta_input': X_test_meta}, y_test),
-        epochs=20, 
+        epochs=30, 
         batch_size=16, 
         callbacks=[early_stopping],
         verbose=1
     )
     train_time_cnn = time.time() - start_time
     
-    # Plot Regularized Learning Curves
+    # Plot Learning Curves
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
     plt.plot(history.history['accuracy'], label='Train Acc')
     plt.plot(history.history['val_accuracy'], label='Val Acc')
-    plt.title('Regularized CNN Accuracy')
+    plt.title('Dual-Input 1D CNN Accuracy')
     plt.legend()
     
     plt.subplot(1, 2, 2)
     plt.plot(history.history['loss'], label='Train Loss')
     plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.title('Regularized CNN Loss')
+    plt.title('Dual-Input 1D CNN Loss')
     plt.legend()
     plt.savefig("learning_curves.png")
-    plt.show()
+    plt.close()
 
-    # CNN Evaluation & Timing
     inf_start = time.time()
     cnn_probs = cnn_model.predict({'text_input': X_test_seq, 'meta_input': X_test_meta})
     inf_time_cnn = time.time() - inf_start
@@ -216,7 +218,7 @@ def main():
     print(classification_report(y_test, y_pred_cnn, target_names=le.classes_))
     plot_confusion_matrix(y_test, y_pred_cnn, le.classes_, '1D CNN Confusion Matrix', cmap='Purples')
     
-    # 5. Print Summary Table for Professor's Feedback
+    # Summary Table
     perf_df = pd.DataFrame(performance_records)
     print("\n==============================================================")
     print("TABLE: MODEL PERFORMANCE, TIMING, AND ERROR METRICS SUMMARY")
